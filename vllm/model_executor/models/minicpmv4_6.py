@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only MiniCPM-V 4.6 model (MiniCPMV4_6ForConditionalGeneration)."""
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Hashable, Iterable, Mapping
 from typing import Any
 
 import numpy as np
@@ -39,12 +39,19 @@ from vllm.multimodal.processing.processor import (
     cached_encode,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.v1.worker.encoder_cudagraph_defs import (
+    EncoderCudaGraphCaptureInputs,
+    EncoderCudaGraphConfig,
+    EncoderCudaGraphReplayBuffers,
+    EncoderItemSpec,
+)
 
 from .idefics2_vision_model import Idefics2VisionTransformer
 from .interfaces import (
     HasInnerState,
     IsHybrid,
     MultiModalEmbeddings,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -958,6 +965,7 @@ class MiniCPMV4_6ForConditionalGeneration(
     HasInnerState,
     IsHybrid,
     SupportsMRoPE,
+    SupportsEncoderCudaGraph,
 ):
     supports_encoder_tp_data = True
 
@@ -1021,6 +1029,7 @@ class MiniCPMV4_6ForConditionalGeneration(
 
         self.config = config
         self.multimodal_config = multimodal_config
+        self.model_config = vllm_config.model_config
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
 
         # --- Vision tower ---
@@ -1340,3 +1349,225 @@ class MiniCPMV4_6ForConditionalGeneration(
     @classmethod
     def get_mamba_state_copy_func(cls):
         return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()
+
+
+    # ----- Encoder Cuda Graph -----
+
+    def get_encoder_cudagraph_config(self) -> "EncoderCudaGraphConfig":
+
+        
+        return EncoderCudaGraphConfig(
+            modalities=["image", "video"],
+            buffer_keys=[
+                
+            ],
+            out_hidden_size=int(self.embed_dim),
+            max_frames_per_video=self.get_max_frames_per_video(),
+        )
+
+    def get_input_modality(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> str:
+        """Return the modality of the inputs (default: image-only)."""
+        if "video_pixel_values" in mm_kwargs:
+            return "video"
+        return "image"
+
+    def get_max_frames_per_video(
+        self,
+    ) -> int:
+        """Return model-specific max frames per video."""
+        info = MULTIMODAL_REGISTRY.get_processing_info(self.model_config)
+        assert isinstance(info, MiniCPMV4_6ProcessingInfo)
+        return int(
+            info.get_num_frames_with_most_features(
+                seq_len=self.vllm_config.model_config.max_model_len,
+                mm_counts={
+                    "video": self.multimodal_config.get_limit_per_prompt("video")
+                },
+            )
+        )
+
+    def get_encoder_cudagraph_budget_range(
+        self,
+        vllm_config: "VllmConfig",
+    ) -> tuple[int, int]:
+        """Return (min_token_budget, max_token_budget) for auto-inference.
+
+        - min_token_budget: estimated smallest possible encoder input
+          (e.g. 64 for a 224x224 image)
+        - max_token_budget: estimated largest budget worth capturing
+          (e.g. max_num_batched_tokens)
+
+        Used when ``encoder_cudagraph_token_budgets`` and/or
+        ``encoder_cudagraph_max_vision_items_per_batch`` are not explicitly
+        specified by the user.
+        """
+        # TODO, is it need to get info in init cause get_max_frames_per_video method also use it
+        info = MULTIMODAL_REGISTRY.get_processing_info(self.model_config)
+        assert isinstance(info, MiniCPMV4_6ProcessingInfo)
+
+        image_processor = info.get_image_processor()
+        scale_res = int(image_processor.scale_resolution)
+        
+        # not exactly correct, but a good estimate
+        min_budget = info.get_num_image_tokens(
+            ImageSize(width=scale_res, height=scale_res)
+        )
+        max_budget = min(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            vllm_config.model_config.max_model_len,
+        )
+        return (min_budget, max_budget)
+
+
+    def get_encoder_cudagraph_item_specs(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list["EncoderItemSpec"]:
+        """Return specs describing each item in the batch.
+
+        Replaces the former separate methods for num_items,
+        per_item_output_tokens, and per_item_input_sizes.
+        The manager derives all three from this single return value.
+        """
+        if "video_pixel_values" in mm_kwargs:
+            tgt_sizes = mm_kwargs["video_tgt_sizes"]
+        else:
+            tgt_sizes = mm_kwargs["tgt_sizes"]
+
+        input_patch_nums = [tgt_size.prod(-1).sum().item() for tgt_size in tgt_sizes]
+        downsample_mode = getattr(self.config, "downsample_mode", "16x")
+        token_divisor = 4 if downsample_mode == "4x" else 16
+
+        return [
+            EncoderItemSpec(
+                input_patch_num,
+                input_patch_num // token_divisor,
+            )
+            for input_patch_num in input_patch_nums
+        ]
+        
+
+    def select_encoder_cudagraph_items(
+        self,
+        mm_kwargs: dict[str, Any],
+        indices: list[int],
+    ) -> dict[str, Any]:
+        """Select a subset of items and return mm_kwargs for the sub-batch.
+
+        Called by the manager during greedy packing and DP sharding to
+        extract inputs for a specific set of items (e.g. images at
+        indices [0, 3, 5]).  The implementation is model-specific
+        because input formats differ:
+
+        - Qwen-family: slice concatenated pixel_values by cumulative
+          patch offsets, subset grid_thw by indices.
+        - Batched models (CLIP): index pixel_values along dim 0.
+
+        Models that configure ``EncoderCudaGraphConfig.capture_axes`` must
+        additionally store the resolved per-axis keys (one key per axis, in
+        order) under ``ENCODER_CUDAGRAPH_AXIS_KEYS_KWARG`` in the returned
+        dict; the manager pops it before the kwargs are used elsewhere.
+        """
+        modality = self.get_input_modality(mm_kwargs)
+        pixel_values_key = "video_pixel_values" if modality == "video" else "pixel_values"
+        tgt_sizes_key = "video_tgt_sizes" if modality == "video" else "tgt_sizes"
+
+        selected_pixel_values = []
+        selected_tgt_sizes = []
+        selected_num_slices = []
+
+        for index in indices:
+            selected_pixel_values.append(mm_kwargs[pixel_values_key][index])
+            selected_tgt_sizes.append(mm_kwargs[tgt_sizes_key][index])
+            selected_num_slices.append(mm_kwargs["num_slices"][index])
+        
+        return {
+            pixel_values_key: selected_pixel_values,
+            tgt_sizes_key: selected_tgt_sizes,
+            "num_slices": selected_num_slices,
+        }
+
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
+    ) -> "EncoderCudaGraphCaptureInputs":
+        """Create dummy inputs and buffers for CUDA graph capture.
+
+        Args:
+            token_budget: Token budget the capture is sized for.
+            max_batch_size: Maximum number of items in a captured batch.
+            max_frames_per_batch: Maximum number of frames in a captured batch.
+            device: Device the dummy inputs and buffers are created on.
+            dtype: Dtype of the dummy inputs and buffers.
+            path: Configured encoder path.
+            axis_keys: The resolved capture-axis keys (one per axis of
+                ``EncoderCudaGraphConfig.capture_axes``) this capture is for.
+                None or empty when no capture axes are configured; models
+                without capture axes ignore it.
+
+        """
+        ...
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        path: str = "default",
+    ) -> "EncoderCudaGraphReplayBuffers":
+        """Compute buffer values from actual batch inputs for replay."""
+        ...
+
+    def encoder_cudagraph_forward(
+        self,
+        inputs: dict[str, torch.Tensor],
+        path: str = "default",
+    ) -> torch.Tensor:
+        """Run the encoder forward pass with precomputed buffers.
+
+        Used during both CUDA graph capture and replay.
+        """
+        ...
+
+    def encoder_eager_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+        path: str = "default",
+    ) -> torch.Tensor:
+        """Run the encoder forward pass without precomputed buffers.
+
+        Used as eager fallback when inputs exceed all budgets.
+        """
+
+        kwargs = {
+            k: v
+            for k, v in kwargs.items()
+            if k in ("pixel_values", "tgt_sizes")
+        }
+        downsample_mode = getattr(self.config, "downsample_mode", "16x")
+        use_vit_merger = downsample_mode != "4x"
+        
+        multimodal_embeddings: tuple[torch.Tensor, ...] = ()
+
+        input = self._parse_and_validate_vision_input(kwargs)
+        if input is not None:
+            multimodal_embeddings += tuple(
+                self._process_vision_input(
+                    input,
+                    use_vit_merger,
+                )
+            )
+        
+        if not multimodal_embeddings:
+            return []
+        return multimodal_embeddings
